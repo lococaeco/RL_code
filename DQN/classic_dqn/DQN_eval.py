@@ -11,9 +11,14 @@ from gymnasium.wrappers import AtariPreprocessing, FrameStackObservation, Record
 
 # 하이퍼파라미터
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-ENV_NAME = ["ALE/Breakout-v5", "ALE/Boxing-v5", "ALE/Enduro-v5", "ALE/Alien-v5", "ALE/Pong-v5"]
-SEED = 1 
+# ENV_NAME = ["ALE/Breakout-v5", "ALE/Boxing-v5", "ALE/Enduro-v5", "ALE/Alien-v5", "ALE/Pong-v5"]
+ENV_NAME = ["ALE/Breakout-v5"]
+SEED = 3 
 MODEL_DIR = "./model"
+
+np.random.seed(SEED)
+torch.manual_seed(SEED)
+torch.backends.cudnn.deterministic = True
 
 # Q-Network 정의
 class QNetwork(nn.Module):
@@ -55,11 +60,10 @@ for env_name in ENV_NAME:
     model_path = os.path.join(MODEL_DIR, f"{env_name.split('/')[-1]}_seed{SEED}", "dqn_latest.pth")
     q_net.load_state_dict(torch.load(model_path, map_location=device))
     q_net.eval()
-
     for episode in range(1):
-        obs, _ = env.reset(seed=SEED + episode)
+        obs, _ = env.reset(seed=SEED + 4)
         done = False
-        print(episode)
+        total_reward = 0
         while not done:
             with torch.no_grad():
                 obs_tensor = torch.tensor(obs, dtype=torch.float32, device=device).unsqueeze(0)  # (1, 4, 84, 84)
@@ -68,5 +72,8 @@ for env_name in ENV_NAME:
 
             obs, reward, terminated, truncated, info = env.step(action)
             done = terminated or truncated
+            total_reward += reward
+
+        print(total_reward, episode)
 
     env.close()

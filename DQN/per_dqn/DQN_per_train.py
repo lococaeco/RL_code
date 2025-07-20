@@ -1,45 +1,40 @@
 import os
 import random
-
-import gymnasium as gym
 import numpy as np
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 import torch.optim as optim
+import gymnasium as gym
+import ale_py
+import wandb
+gym.register_envs(ale_py)
+import matplotlib.pyplot as plt
 
 from stable_baselines3.common.atari_wrappers import (
     ClipRewardEnv,
     EpisodicLifeEnv,
     FireResetEnv,
     MaxAndSkipEnv,
-    NoopResetEnv,
 )
 
-def make_env(env_id, seed, idx, capture_video):
-    def thunk():
-        if capture_video and idx == 0:
-            env = gym.make(env_id, render_mode="rgb_array")
-        else:
-            env = gym.make(env_id)
-        env = gym.wrappers.RecordEpisodeStatistics(env)
-
-        env = NoopResetEnv(env, noop_max=30)
-        env = MaxAndSkipEnv(env, skip=4)
-        env = EpisodicLifeEnv(env)
-        if "FIRE" in env.unwrapped.get_action_meanings():
-            env = FireResetEnv(env)
-        env = ClipRewardEnv(env)
-        env = gym.wrappers.ResizeObservation(env, (84, 84))
-        env = gym.wrappers.GrayScaleObservation(env)
-        env = gym.wrappers.FrameStack(env, 4)
-        print(env.observation_space)
-
-        env.action_space.seed(seed)
-        return env
-
-    return thunk
-
+############# HyperParameter ###############
+ENV_NAME = ["ALE/Breakout-v5", "ALE/Boxing-v5", "ALE/Enduro-v5", "ALE/Alien-v5", "ALE/Pong-v5"]
+LR = 1e-4
+BUFFER_SIZE = 100000 
+TOTAL_STEP = 10000000
+START_E = 1.0
+END_E = 0.1
+FRACTION = 0.1
+LEARNING_START = 8000
+TRAIN_FREQ = 4
+BATCH_SIZE = 32
+GAMMA = 0.99
+TARGET_UPDATE_FREQ = 1000
+TAU = 1.0
+# SEED = [1, 2, 3, 5, 8]
+SEED = [3]
+use_wandb = True  
 
 class QNetwork(nn.Module):
     def __init__(self, env):
@@ -60,227 +55,216 @@ class QNetwork(nn.Module):
     def forward(self, x):
         return self.network(x / 255.0)
 
-
-def linear_schedule(start_e: float, end_e: float, duration: int, t: int):
+def linear_schedule(start_e, end_e, duration, t):
     slope = (end_e - start_e) / duration
     return max(slope * t + start_e, end_e)
 
+import heapq
+
 class PrioritizedReplayBuffer:
-    def __init__(self, buffer_size, state_dim, action_dim, device="cpu", alpha=0.6, beta_start=0.4, beta_frames=1000000):
+    def __init__(self, buffer_size, state_dim, alpha=0.6, beta=0.4, beta_increment_per_sampling=1e-6, eps=1e-5, device="cpu"):
         self.buffer_size = buffer_size
-        self.state_dim = state_dim
-        self.action_dim = action_dim
+        self.alpha = alpha
+        self.beta = beta
+        self.beta_increment_per_sampling = beta_increment_per_sampling
+        self.eps = eps
         self.device = device
 
         self.observations = np.zeros((buffer_size, *state_dim), dtype=np.uint8)
         self.next_observations = np.zeros((buffer_size, *state_dim), dtype=np.uint8)
-        self.actions = np.zeros((buffer_size, action_dim), dtype=np.int64)
+        self.actions = np.zeros((buffer_size,), dtype=np.int64)
         self.rewards = np.zeros((buffer_size,), dtype=np.float32)
         self.dones = np.zeros((buffer_size,), dtype=np.float32)
         self.priorities = np.zeros((buffer_size,), dtype=np.float32)
 
         self.pos = 0
         self.full = False
-
-        self.alpha = alpha
-        self.beta_start = beta_start
-        self.beta_frames = beta_frames
-        self.frame = 1
+        self.max_priority = 1.0
 
     def add(self, obs, next_obs, action, reward, done):
-        max_prio = self.priorities.max() if self.full else 1.0
-
         self.observations[self.pos] = obs
         self.next_observations[self.pos] = next_obs
         self.actions[self.pos] = action
         self.rewards[self.pos] = reward
         self.dones[self.pos] = done
-        self.priorities[self.pos] = max_prio
-
+        self.priorities[self.pos] = self.max_priority
         self.pos = (self.pos + 1) % self.buffer_size
-        if self.pos == 0:
-            self.full = True
+        self.full = self.full or self.pos == 0
 
     def sample(self, batch_size):
-        if self.full:
-            prios = self.priorities
-            total = self.buffer_size
-        else:
-            prios = self.priorities[:self.pos]
-            total = self.pos
-
-        probs = prios ** self.alpha
+        total = self.buffer_size if self.full else self.pos
+        probs = self.priorities[:total] ** self.alpha
         probs /= probs.sum()
 
         indices = np.random.choice(total, batch_size, p=probs)
-        self.frame += 1
-        beta = min(1.0, self.beta_start + self.frame * (1.0 - self.beta_start) / self.beta_frames)
-
-        weights = (total * probs[indices]) ** (-beta)
+        weights = (total * probs[indices]) ** (-self.beta)
         weights /= weights.max()
-
-        obs_batch = self.observations[indices]
-        next_obs_batch = self.next_observations[indices]
-        actions_batch = self.actions[indices]
-        rewards_batch = self.rewards[indices]
-        dones_batch = self.dones[indices]
+        self.beta = min(1.0, self.beta + self.beta_increment_per_sampling)
 
         return (
-            torch.tensor(obs_batch, dtype=torch.uint8, device=self.device),
-            torch.tensor(actions_batch, dtype=torch.int64, device=self.device),
-            torch.tensor(next_obs_batch, dtype=torch.uint8, device=self.device),
-            torch.tensor(rewards_batch, dtype=torch.float32, device=self.device).unsqueeze(1),
-            torch.tensor(dones_batch, dtype=torch.float32, device=self.device).unsqueeze(1),
+            torch.tensor(self.observations[indices], dtype=torch.uint8, device=self.device),
+            torch.tensor(self.actions[indices], dtype=torch.int64, device=self.device).unsqueeze(1),
+            torch.tensor(self.next_observations[indices], dtype=torch.uint8, device=self.device),
+            torch.tensor(self.rewards[indices], dtype=torch.float32, device=self.device).unsqueeze(1),
+            torch.tensor(self.dones[indices], dtype=torch.float32, device=self.device).unsqueeze(1),
             torch.tensor(weights, dtype=torch.float32, device=self.device).unsqueeze(1),
-            indices
+            indices,
         )
 
-    def update_priorities(self, indices, priorities):
-        self.priorities[indices] = priorities.detach().cpu().numpy()
+    def update_priorities(self, indices, td_errors):
+        td_errors = td_errors.detach().cpu().numpy().squeeze()
+        for idx, td_error in zip(indices, td_errors):
+            self.priorities[idx] = np.abs(td_error) + self.eps
+            self.max_priority = max(self.max_priority, self.priorities[idx])
 
+
+def init_wandb(env_name, seed):
+    wandb.init(
+        project="DQN-Atari-10000000",
+        group=env_name.replace("/", "_"),
+        name=f"DQN_per_{env_name.replace('/', '_')}_seed{seed}",
+        config={
+            "env_name": env_name,
+            "seed": seed,
+            "lr": LR,
+            "gamma": GAMMA,
+            "buffer_size": BUFFER_SIZE,
+            "batch_size": BATCH_SIZE,
+            "total_steps": TOTAL_STEP,
+            "train_freq": TRAIN_FREQ,
+            "target_update_freq": TARGET_UPDATE_FREQ,
+            "tau": TAU,
+            "start_e": START_E,
+            "end_e": END_E,
+            "exploration_fraction": FRACTION,
+            "learning_start": LEARNING_START,
+            "architecture": "DQN_CNN_3Conv_2FC",
+        },
+        save_code=True,
+        monitor_gym=True,
+    )
 
 
 if __name__ == "__main__":
-    model_path = "./model"
-    os.makedirs(model_path, exist_ok=True)
-    seed = 1
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    env_name = "BreakoutNoFrameskip-v4"
-    random.seed(seed)
-    np.random.seed(seed)
-    torch.manual_seed(seed)
-    torch.backends.cudnn.deterministic = True
-    
-    learning_rate = 1e-4
-    buffer_size = 100000 
-    total_timesteps = 10000000
-    start_e = 1.0
-    end_e = 0.1
-    exploration_fraction = 0.1
-    learning_starts = 80000
-    train_frequency = 4
-    batch_size = 32
-    gamma = 0.99
-    target_network_frequency = 1000
-    tau = 1.0
 
-    episode = 0
-    use_wandb = True
-    if use_wandb:
-        import wandb
+    for env_name in ENV_NAME:
+        for seed in SEED:
+            episode = 0
+            eppisodic_return = 0
 
-        wandb.init(
-            project="dqn-breakout",
-            config={
-                "env_name": env_name,
-                "total_timesteps": total_timesteps,
-                "learning_rate": learning_rate,
-                "buffer_size": buffer_size,
-                "batch_size": batch_size,
-                "gamma": gamma,
-                "start_e": start_e,
-                "end_e": end_e,
-                "exploration_fraction": exploration_fraction,
-                "train_frequency": train_frequency,
-                "learning_starts": learning_starts,
-                "target_network_frequency": target_network_frequency,
-                "tau": tau,
-                "seed": seed,
-            },
-        )
+            print(f"Training {env_name} with seed {seed}")
+            model_path = f"./model/{env_name.split('/')[-1]}_seed{seed}"
+            os.makedirs(model_path, exist_ok=True)
 
-    envs = gym.vector.SyncVectorEnv(
-        [make_env(env_name, seed + i, i, False) for i in range(1)]
-    )
+            random.seed(seed)
+            np.random.seed(seed)
+            torch.manual_seed(seed)
+            torch.backends.cudnn.deterministic = True
 
-    q_network = QNetwork(envs).to(device)
-    optimizer = optim.Adam(q_network.parameters(), lr=learning_rate)
-    target_network = QNetwork(envs).to(device)
-    target_network.load_state_dict(q_network.state_dict())
+            if use_wandb:
+                init_wandb(env_name, seed)
 
-    obs_shape = envs.single_observation_space.shape
-    action_shape = (1,)  # Discrete 환경일 경우
-
-    rb = PrioritizedReplayBuffer(
-    buffer_size=buffer_size,
-    state_dim=obs_shape,
-    action_dim=action_shape[0],
-    device=device
-    )
+            envs = gym.vector.SyncVectorEnv([
+                lambda: EpisodicLifeEnv( 
+                    gym.wrappers.FrameStackObservation(
+                    gym.wrappers.AtariPreprocessing(
+                        gym.make(env_name, frameskip=1),
+                        noop_max=30,
+                        frame_skip=4,
+                        screen_size=84,
+                        terminal_on_life_loss=False,
+                        grayscale_obs=True
+                    ),
+                    stack_size=4,
+                    padding_type="zero",
+                ),
+                ),
+            ])
 
 
+            q_network = QNetwork(envs).to(device)
+            target_network = QNetwork(envs).to(device)
+            target_network.load_state_dict(q_network.state_dict())
+            optimizer = optim.Adam(q_network.parameters(), lr=LR)
 
-    state, _ = envs.reset(seed=seed)
-    for global_step in range(total_timesteps):
-        epsilon = linear_schedule(start_e, end_e, exploration_fraction * total_timesteps, global_step)
-        if random.random() < epsilon:
-            actions = np.array([envs.single_action_space.sample() for _ in range(envs.num_envs)])
-        else:
-            q_values = q_network(torch.Tensor(state).to(device))
-            actions = torch.argmax(q_values, dim=1).cpu().numpy()
+            obs_shape = envs.single_observation_space.shape
+            rb = PrioritizedReplayBuffer(
+                BUFFER_SIZE, 
+                obs_shape, 
+                alpha=0.6, 
+                beta=0.4, 
+                device=device
+            )
 
-        next_state, rewards, terminations, truncations, infos = envs.step(actions)
-        if "final_info" in infos:
-            for info in infos["final_info"]:
-                if info and "episode" in info:
+            state, _ = envs.reset(seed=seed)
+
+            for global_step in range(TOTAL_STEP):
+                epsilon = linear_schedule(START_E, END_E, FRACTION * TOTAL_STEP, global_step)
+
+                if random.random() < epsilon:
+                    actions = np.array([envs.single_action_space.sample()])
+                else:
+                    with torch.no_grad():
+                        q_values = q_network(torch.tensor(state, dtype=torch.float32, device=device))
+                        actions = torch.argmax(q_values, dim=1).cpu().numpy()
+
+                next_state, rewards, terminations, truncations, infos = envs.step(actions)
+                dones = np.logical_or(terminations, truncations)
+                rb.add(state[0], next_state[0], actions[0], rewards[0], dones[0])
+                state = next_state
+                eppisodic_return += rewards[0] 
+
+                if dones[0]:
                     episode += 1
-                    print(f"steps:{global_step}, episode:{episode}, reward:{info['episode']['r']}, stepLength:{info['episode']['l']}")
+                    print(f'episode:{episode}, step:{global_step}, return:{eppisodic_return}')
+                    state, _ = envs.reset()
+                    
                     if use_wandb:
-                        wandb.log(
-                            {
-                                "episode": episode,
-                                "episodic_return": info["episode"]["r"],
-                                "episodic_length": info["episode"]["l"],
-                                "epsilon": epsilon,
-                                "global_step": global_step,
-                            }
-                        )
-
-        real_next_state = next_state.copy()
-        for idx, trunc in enumerate(truncations):
-            if trunc:
-                real_next_state[idx] = infos["final_observation"][idx]
-        rb.add(state, real_next_state, actions, rewards, terminations)
-
-
-        state = next_state
-
-        if global_step > learning_starts:
-            if global_step % train_frequency == 0:
-                obs, actions, next_obs, rewards, dones, weights, indices = rb.sample(batch_size)
-                with torch.no_grad():
-                    target_max = target_network(next_obs).max(1)[0]
-                    td_target = rewards.flatten() + gamma * target_max * (1 - dones.flatten())
-
-                q_values = q_network(obs)
-                q_action = q_values.gather(1, actions).squeeze()
-
-                td_error = td_target - q_action
-                loss = (weights.flatten() * td_error ** 2).mean()
-
-                optimizer.zero_grad()
-                loss.backward()
-                optimizer.step()
-
-                new_priorities = td_error.abs() + 1e-6
-                rb.update_priorities(indices, new_priorities)
-
-                if use_wandb:
-                    wandb.log({
-                            "loss": loss.item(),
+                        wandb.log({
+                            "episode": episode,
+                            "episodic_return": eppisodic_return,
+                            "episodic_length": infos['episode_frame_number'][0],
+                            "epsilon": epsilon,
                             "global_step": global_step
-                            })
+                        })
+                    
+                    eppisodic_return = 0
 
+                if global_step > LEARNING_START and global_step % TRAIN_FREQ == 0:
+                    obs, actions_batch, next_obs, rewards, dones_batch, weights, indices = rb.sample(BATCH_SIZE)
 
-            if global_step % target_network_frequency == 0:
-                for target_network_param, q_network_param in zip(target_network.parameters(), q_network.parameters()):
-                    target_network_param.data.copy_(
-                        tau * q_network_param.data + (1.0 - tau) * target_network_param.data
-                    )
+                    with torch.no_grad():
+                        next_q = target_network(next_obs.float())
+                        target_q = rewards + GAMMA * (1 - dones_batch) * next_q.max(1)[0].unsqueeze(1)
 
-            if episode % 1000 == 0:
-                model_file = os.path.join(model_path, f"Breakout_dqn_classic_{episode}.pth")
-                torch.save(q_network.state_dict(), model_file)
-                print(f"✅ Saved model at episode {episode} to {model_file}")
+                    current_q = q_network(obs.float()).gather(1, actions_batch)
+                    td_errors = current_q - target_q
+                    loss = (weights * td_errors.pow(2)).mean()
 
-    envs.close()
+                    optimizer.zero_grad()
+                    loss.backward()
+                    optimizer.step()
+
+                    rb.update_priorities(indices, td_errors)
+
+                    if use_wandb:
+                        wandb.log({
+                            "loss": loss.item(),
+                            "global_step": global_step,
+                            "TD-errors": td_errors,
+                        
+                        })
+
+                if global_step % TARGET_UPDATE_FREQ == 0:
+                    for target_param, param in zip(target_network.parameters(), q_network.parameters()):
+                        target_param.data.copy_(TAU * param.data + (1.0 - TAU) * target_param.data)
+
+                if global_step % 100000 == 0:
+                    model_file = os.path.join(model_path, f"dqn_latest.pth")
+                    torch.save(q_network.state_dict(), model_file)
+                    print(f"Saved model at step {global_step} to {model_file}")
+
+            envs.close()
+            if use_wandb:
+                wandb.finish()

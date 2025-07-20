@@ -1,39 +1,26 @@
 import os
-import gymnasium as gym
-import numpy as np
 import torch
 import torch.nn as nn
-import torch.nn.functional as F
-from stable_baselines3.common.atari_wrappers import (
-    ClipRewardEnv,
-    EpisodicLifeEnv,
-    FireResetEnv,
-    MaxAndSkipEnv,
-    NoopResetEnv,
-)
-from gymnasium.wrappers import RecordEpisodeStatistics, RecordVideo, ResizeObservation, GrayScaleObservation, FrameStack
+import gymnasium as gym
+import numpy as np
+import ale_py
+gym.register_envs(ale_py)
 
+from stable_baselines3.common.atari_wrappers import EpisodicLifeEnv
+from gymnasium.wrappers import AtariPreprocessing, FrameStackObservation, RecordVideo
 
-def make_env(env_id, seed, idx, capture_video):
-    def thunk():
-        env = gym.make(env_id, render_mode="rgb_array" if capture_video else None)
-        if capture_video and idx == 0:
-            env = RecordVideo(env, video_folder=f"videos_eval/{env_id}", episode_trigger=lambda e: True)
-        env = RecordEpisodeStatistics(env)
-        env = NoopResetEnv(env, noop_max=30)
-        env = MaxAndSkipEnv(env, skip=4)
-        env = EpisodicLifeEnv(env)
-        if "FIRE" in env.unwrapped.get_action_meanings():
-            env = FireResetEnv(env)
-        env = ClipRewardEnv(env)
-        env = ResizeObservation(env, (84, 84))
-        env = GrayScaleObservation(env)
-        env = FrameStack(env, 4)
-        env.action_space.seed(seed)
-        return env
-    return thunk
+# 하이퍼파라미터
+device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+# ENV_NAME = ["ALE/Breakout-v5", "ALE/Boxing-v5", "ALE/Enduro-v5", "ALE/Alien-v5", "ALE/Pong-v5"]
+ENV_NAME = ["ALE/Breakout-v5"]
+SEED = 3 
+MODEL_DIR = "./model"
 
+np.random.seed(SEED)
+torch.manual_seed(SEED)
+torch.backends.cudnn.deterministic = True
 
+# Q-Network 정의
 class QNetwork(nn.Module):
     def __init__(self, env):
         super().__init__()
@@ -66,42 +53,40 @@ class QNetwork(nn.Module):
         q_values = values + (advantages - advantages.mean(dim=1, keepdim=True))
         return q_values
 
+# 영상 기록 + 학습된 모델 추론
+for env_name in ENV_NAME:
+    print(f"Rendering {env_name}...")
+    env = gym.make(env_name, frameskip=1, render_mode="rgb_array")
+    env = AtariPreprocessing(env, noop_max=30, frame_skip=4, screen_size=84, terminal_on_life_loss = False, grayscale_obs=True)
+    env = FrameStackObservation(env, stack_size=4, padding_type="zero")
 
-if __name__ == "__main__":
-    model_file = "./model/Breakout_dqn_classic_9000.pth"
-    seed = 1
-    env_id = "BreakoutNoFrameskip-v4"
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    capture_video = True
-    episodes_to_eval = 5
+    # 영상 저장 래퍼
+    env = RecordVideo(
+        env,
+        episode_trigger=lambda _: True,
+        video_folder=f"./video/video_{env_name.split('/')[1]}",
+        name_prefix="video-"
+    )
 
-    os.makedirs("videos_eval", exist_ok=True)
-
-    env = make_env(env_id, seed, 0, capture_video=capture_video)()
-    q_network = QNetwork(env).to(device)
-    q_network.load_state_dict(torch.load(model_file, map_location=device))
-    q_network.eval()
-
-    episode_returns = []
-
-    for episode in range(episodes_to_eval):
-        state, _ = env.reset(seed=seed)
-        total_reward = 0
+    # Q-Network 로드
+    q_net = QNetwork(env).to(device)
+    model_path = os.path.join(MODEL_DIR, f"{env_name.split('/')[-1]}_seed{SEED}", "dqn_latest.pth")
+    q_net.load_state_dict(torch.load(model_path, map_location=device))
+    q_net.eval()
+    for episode in range(1):
+        obs, _ = env.reset(seed=SEED + 23)
         done = False
-
+        total_reward = 0
         while not done:
             with torch.no_grad():
-                state_tensor = torch.tensor(np.array(state), dtype=torch.float32).unsqueeze(0).to(device)
-                q_values = q_network(state_tensor)
-                action = torch.argmax(q_values, dim=1).item()
+                obs_tensor = torch.tensor(obs, dtype=torch.float32, device=device).unsqueeze(0)  # (1, 4, 84, 84)
+                q_values = q_net(obs_tensor)
+                action = q_values.argmax(dim=1).item()
 
-            next_state, reward, terminated, truncated, info = env.step(action)
+            obs, reward, terminated, truncated, info = env.step(action)
             done = terminated or truncated
             total_reward += reward
-            state = next_state
 
-        episode_returns.append(total_reward)
-        print(f"🎮 Episode {episode + 1} Return: {total_reward}")
+        print(total_reward, episode)
 
     env.close()
-    print(f"✅ Evaluation done. Mean return: {np.mean(episode_returns):.2f}")
